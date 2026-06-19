@@ -281,19 +281,24 @@ class Client extends EventEmitter {
             }
         }
 
-        await exposeFunctionIfAbsent(
-            this.pupPage,
-            'onAuthAppStateChangedEvent',
-            async (state) => {
-                if (
-                    state == 'UNPAIRED_IDLE' &&
-                    !pairWithPhoneNumber.phoneNumber
-                ) {
-                    // refresh qr code
-                    window.require('WAWebCmd').Cmd.refreshQR();
-                }
-            },
-        );
+        // In pairing-code mode this handler is a guaranteed no-op (it only refreshes the QR
+        // when no phone number is set), so skip exposing it to keep the companion-link page's
+        // injected-callback footprint minimal — fewer automation tells at registration time.
+        if (!pairWithPhoneNumber?.phoneNumber) {
+            await exposeFunctionIfAbsent(
+                this.pupPage,
+                'onAuthAppStateChangedEvent',
+                async (state) => {
+                    if (
+                        state == 'UNPAIRED_IDLE' &&
+                        !pairWithPhoneNumber.phoneNumber
+                    ) {
+                        // refresh qr code
+                        window.require('WAWebCmd').Cmd.refreshQR();
+                    }
+                },
+            );
+        }
 
         await exposeFunctionIfAbsent(
             this.pupPage,
