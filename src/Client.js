@@ -531,28 +531,147 @@ class Client extends EventEmitter {
         );
         return await this.pupPage.evaluate(
             async (phoneNumber, showNotification, intervalMs) => {
-                const getCode = async () => {
-                    window
-                        .require('WAWebAltDeviceLinkingApi')
-                        .setPairingType('ALT_DEVICE_LINKING');
-                    await window
-                        .require('WAWebAltDeviceLinkingApi')
-                        .initializeAltDeviceLinking();
-                    return window
-                        .require('WAWebAltDeviceLinkingApi')
-                        .startAltLinkingFlow(phoneNumber, showNotification);
+                const ALT_MODULE = 'WAWebAltDeviceLinkingApi';
+                const REQUIRED_METHODS = [
+                    'setPairingType',
+                    'initializeAltDeviceLinking',
+                    'startAltLinkingFlow',
+                ];
+
+                // Resolve the alt-linking API defensively: window.require first, then a
+                // best-effort moduleRaid scan so a future internal-module rename degrades
+                // to a clear error instead of a bare "undefined" TypeError.
+                const resolveApi = () => {
+                    try {
+                        const m = window.require(ALT_MODULE);
+                        if (
+                            m &&
+                            REQUIRED_METHODS.every(
+                                (k) => typeof m[k] === 'function',
+                            )
+                        ) {
+                            return m;
+                        }
+                    } catch (ignoredError) {
+                        /* not registered yet */
+                    }
+                    try {
+                        const mr = window.mR || window.moduleRaid;
+                        const modules = mr && mr.modules;
+                        if (modules) {
+                            for (const key of Object.keys(modules)) {
+                                const mod =
+                                    modules[key] && modules[key].exports;
+                                if (
+                                    mod &&
+                                    REQUIRED_METHODS.every(
+                                        (k) => typeof mod[k] === 'function',
+                                    )
+                                ) {
+                                    return mod;
+                                }
+                            }
+                        }
+                    } catch (ignoredError) {
+                        /* moduleRaid unavailable */
+                    }
+                    return null;
                 };
+
+                // Requesting a code immediately on initialize() can race module
+                // registration and throw a TypeError on undefined — poll briefly until
+                // the linking API is ready instead.
+                const waitForApi = async (timeoutMs) => {
+                    const start = Date.now();
+                    let api = resolveApi();
+                    while (!api && Date.now() - start < timeoutMs) {
+                        await new Promise((r) => setTimeout(r, 250));
+                        api = resolveApi();
+                    }
+                    return api;
+                };
+
+                // Surface the real cause. The alt-linking flow throws minified domain
+                // errors (InvalidRefError / OldCodeError / MaxPrimaryHelloError); without
+                // this the bridge only sees an opaque single-letter error name.
+                const describeError = (e) => {
+                    if (!e) return 'unknown';
+                    const name =
+                        (e.name && e.name !== 'Error' && e.name) ||
+                        (e.constructor && e.constructor.name) ||
+                        e.name ||
+                        'Error';
+                    const msg = e.message || (typeof e === 'string' ? e : '');
+                    return msg ? name + ': ' + msg : name;
+                };
+
+                const getCode = async () => {
+                    const api = await waitForApi(20000);
+                    if (!api) {
+                        throw new Error(
+                            'requestPairingCode: WAWebAltDeviceLinkingApi unavailable (module not ready)',
+                        );
+                    }
+                    try {
+                        api.setPairingType('ALT_DEVICE_LINKING');
+                        await api.initializeAltDeviceLinking();
+                        return await api.startAltLinkingFlow(
+                            phoneNumber,
+                            showNotification,
+                        );
+                    } catch (e) {
+                        // Production WhatsApp Web is minified, so e.name is an opaque
+                        // single letter. The module DOES export its error classes, so
+                        // classify by identity to get a stable, readable tag the bridge
+                        // can act on (MaxPrimaryHelloError => stop hammering, OldCodeError
+                        // => refetch, etc.).
+                        let tag = '';
+                        try {
+                            if (
+                                api.MaxPrimaryHelloError &&
+                                e instanceof api.MaxPrimaryHelloError
+                            ) {
+                                tag = 'MaxPrimaryHelloError';
+                            } else if (
+                                api.OldCodeError &&
+                                e instanceof api.OldCodeError
+                            ) {
+                                tag = 'OldCodeError';
+                            } else if (
+                                api.InvalidRefError &&
+                                e instanceof api.InvalidRefError
+                            ) {
+                                tag = 'InvalidRefError';
+                            }
+                        } catch (ignoredError) {
+                            /* identity check unavailable */
+                        }
+                        throw new Error(
+                            'requestPairingCode: alt linking flow failed - ' +
+                                (tag
+                                    ? tag + ' (' + describeError(e) + ')'
+                                    : describeError(e)),
+                        );
+                    }
+                };
+
                 if (window.codeInterval) {
                     clearInterval(window.codeInterval); // remove existing interval
                 }
                 window.codeInterval = setInterval(async () => {
-                    const state =
-                        window.require('WAWebSocketModel').Socket.state;
-                    if (state != 'UNPAIRED' && state != 'UNPAIRED_IDLE') {
+                    try {
+                        const state =
+                            window.require('WAWebSocketModel').Socket.state;
+                        if (state != 'UNPAIRED' && state != 'UNPAIRED_IDLE') {
+                            clearInterval(window.codeInterval);
+                            return;
+                        }
+                        window.onCodeReceivedEvent(await getCode());
+                    } catch (ignoredError) {
+                        // A failed refresh must not become an unhandled rejection;
+                        // stop the loop and let the next initialize() retry cleanly.
                         clearInterval(window.codeInterval);
-                        return;
                     }
-                    window.onCodeReceivedEvent(await getCode());
                 }, intervalMs);
                 return window.onCodeReceivedEvent(await getCode());
             },
